@@ -1,0 +1,647 @@
+```react
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, addDoc, query, onSnapshot, orderBy } from 'firebase/firestore';
+import { Camera, Upload, CheckCircle, XCircle, LogOut, FileSpreadsheet, FileText, Clock, User, Calendar, AlertTriangle } from 'lucide-react';
+
+// --- FIREBASE INITIALIZATION ---
+// Menggunakan konfigurasi environment dari platform
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'absensi-app-default';
+
+export default function App() {
+  const [firebaseUser, setFirebaseUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  // App States
+  const [currentUser, setCurrentUser] = useState(null); // { name: '..', role: 'admin' | 'karyawan' }
+  const [records, setRecords] = useState([]);
+  
+  // Login States
+  const [loginUsername, setLoginUsername] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [loginError, setLoginError] = useState('');
+
+  // Firebase Auth Setup
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        await signInAnonymously(auth);
+      } catch (error) {
+        console.error("Auth error:", error);
+      }
+    };
+    initAuth();
+
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setFirebaseUser(user);
+      setLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Fetch Data Setup
+  useEffect(() => {
+    if (!firebaseUser || currentUser?.role !== 'admin') return;
+
+    const q = query(collection(db, 'artifacts', appId, 'public', 'data', 'attendance'));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const data = [];
+      snapshot.forEach((doc) => {
+        data.push({ id: doc.id, ...doc.data() });
+      });
+      // Sort in memory (descending by timestamp)
+      data.sort((a, b) => b.timestamp - a.timestamp);
+      setRecords(data);
+    }, (error) => {
+      console.error("Error fetching records:", error);
+    });
+
+    return () => unsubscribe();
+  }, [firebaseUser, currentUser]);
+
+  const handleLogin = (e) => {
+    e.preventDefault();
+    setLoginError('');
+    
+    if (loginUsername.toLowerCase() === 'admin' && loginPassword === 'admin') {
+      setCurrentUser({ name: 'Owner', role: 'admin' });
+    } else if (loginUsername.trim() !== '' && loginPassword === 'karyawan') {
+      setCurrentUser({ name: loginUsername.trim(), role: 'karyawan' });
+    } else {
+      setLoginError('Username atau Password salah!');
+    }
+  };
+
+  const handleLogout = () => {
+    setCurrentUser(null);
+    setLoginUsername('');
+    setLoginPassword('');
+  };
+
+  if (loading) {
+    return <div className="min-h-screen flex items-center justify-center bg-gray-50"><p>Memuat sistem...</p></div>;
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-100 text-gray-800 font-sans">
+      {!currentUser ? (
+        <LoginScreen 
+          username={loginUsername} 
+          setUsername={setLoginUsername} 
+          password={loginPassword} 
+          setPassword={setLoginPassword} 
+          onLogin={handleLogin} 
+          error={loginError} 
+        />
+      ) : currentUser.role === 'admin' ? (
+        <AdminDashboard records={records} onLogout={handleLogout} />
+      ) : (
+        <EmployeeDashboard user={currentUser} onLogout={handleLogout} db={db} appId={appId} />
+      )}
+    </div>
+  );
+}
+
+// ==========================================
+// LOGIN SCREEN
+// ==========================================
+function LoginScreen({ username, setUsername, password, setPassword, onLogin, error }) {
+  return (
+    <div className="flex items-center justify-center min-h-screen p-4">
+      <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-8">
+        <div className="text-center mb-8">
+          <div className="bg-blue-600 text-white w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4 shadow-lg">
+            <Camera size={32} />
+          </div>
+          <h1 className="text-2xl font-bold text-gray-800">Sistem Absensi</h1>
+          <p className="text-gray-500 text-sm mt-1">Silakan masuk untuk melanjutkan</p>
+        </div>
+        
+        {error && <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded mb-4 text-sm">{error}</div>}
+        
+        <form onSubmit={onLogin} className="space-y-5">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Username (Nama Anda)</label>
+            <input 
+              type="text" 
+              className="w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
+              placeholder="Masukkan nama Anda"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              required
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Password</label>
+            <input 
+              type="password" 
+              className="w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
+              placeholder="Password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              required
+            />
+          </div>
+          <button type="submit" className="w-full bg-blue-600 text-white font-bold py-3 rounded-lg hover:bg-blue-700 transition shadow-md">
+            Masuk
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+// ==========================================
+// EMPLOYEE DASHBOARD (ABSENSI FORM)
+// ==========================================
+function EmployeeDashboard({ user, onLogout, db, appId }) {
+  const [step, setStep] = useState(1);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [successMsg, setSuccessMsg] = useState('');
+  
+  // Form Data
+  const [jabatan, setJabatan] = useState('');
+  const [shift, setShift] = useState('');
+  const [statusKehadiran, setStatusKehadiran] = useState(''); // Hadir / Tidak Hadir
+  const [tipeAbsen, setTipeAbsen] = useState(''); // Datang / Pulang
+  const [alasan, setAlasan] = useState(''); // Izin / Sakit
+  const [keterangan, setKeterangan] = useState('');
+  const [foto, setFoto] = useState(null); // Base64
+
+  const fileInputRef = useRef(null);
+
+  const listJabatan = ['Host Live', 'Kasir', 'Shopkeeper'];
+  const listShiftReguler = ['Pagi (08:00)', 'Sore (15:00)'];
+  const listShiftHost = [
+    '05:00 - 08:00', '08:00 - 11:00', '11:00 - 14:00', 
+    '14:00 - 17:00', '17:00 - 20:00', '20:00 - 23:00', 
+    '23:00 - 02:00', '02:00 - 05:00'
+  ];
+
+  // Fungsi Kompresi Gambar agar muat di database
+  const handlePhotoCapture = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.readAsDataURL(file);
+    reader.onload = (event) => {
+      const img = new Image();
+      img.src = event.target.result;
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        const MAX_WIDTH = 500;
+        const scaleSize = MAX_WIDTH / img.width;
+        canvas.width = MAX_WIDTH;
+        canvas.height = img.height * scaleSize;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        setFoto(canvas.toDataURL('image/jpeg', 0.6));
+      };
+    };
+  };
+
+  const checkLateness = (roleSelected, shiftSelected, currentTimeStr) => {
+    if (roleSelected === 'Host Live') return false; // Host live bebas jam
+    if (!shiftSelected) return false;
+
+    const [hours, minutes] = currentTimeStr.split(':').map(Number);
+    const totalMins = hours * 60 + minutes;
+
+    // Toleransi 15 menit
+    if (shiftSelected.includes('Pagi')) {
+      return totalMins > (8 * 60 + 15); // > 08:15
+    } else if (shiftSelected.includes('Sore')) {
+      return totalMins > (15 * 60 + 15); // > 15:15
+    }
+    return false;
+  };
+
+  const handleSubmit = async () => {
+    if (statusKehadiran === 'Hadir' && !foto) {
+      alert("Mohon unggah foto kehadiran!"); return;
+    }
+    if (statusKehadiran === 'Tidak Hadir' && !keterangan) {
+      alert("Mohon isi keterangan alasan!"); return;
+    }
+
+    setIsSubmitting(true);
+    const now = new Date();
+    
+    // Format tanggal Indonesia: DD/MM/YYYY
+    const dateStr = now.toLocaleDateString('id-ID');
+    // Format Jam: HH:MM
+    const timeStr = now.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
+    
+    const isLate = statusKehadiran === 'Hadir' && tipeAbsen === 'Datang' ? checkLateness(jabatan, shift, timeStr) : false;
+
+    const recordData = {
+      name: user.name,
+      jabatan: jabatan,
+      shift: shift,
+      status: statusKehadiran,
+      tipe: tipeAbsen || '-',
+      alasan: alasan || '-',
+      keterangan: keterangan || '-',
+      foto: foto || null,
+      date: dateStr,
+      time: timeStr,
+      timestamp: now.getTime(),
+      isLate: isLate
+    };
+
+    try {
+      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'attendance'), recordData);
+      setSuccessMsg(`Berhasil melakukan absensi pada ${timeStr}`);
+      setStep(100); // Tampilan sukses
+    } catch (error) {
+      console.error("Error saving doc", error);
+      alert("Terjadi kesalahan saat menyimpan data.");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const resetForm = () => {
+    setStep(1); setJabatan(''); setShift(''); setStatusKehadiran('');
+    setTipeAbsen(''); setAlasan(''); setKeterangan(''); setFoto(null); setSuccessMsg('');
+  };
+
+  return (
+    <div className="max-w-md mx-auto min-h-screen bg-white shadow-lg relative pb-20">
+      {/* Header */}
+      <div className="bg-blue-600 text-white p-4 flex justify-between items-center shadow-md">
+        <div className="flex items-center gap-2">
+          <User size={20} />
+          <span className="font-semibold truncate max-w-[150px]">{user.name}</span>
+        </div>
+        <button onClick={onLogout} className="flex items-center gap-1 text-sm bg-blue-700 px-3 py-1 rounded-full hover:bg-blue-800">
+          <LogOut size={16} /> Keluar
+        </button>
+      </div>
+
+      <div className="p-6">
+        {step === 1 && (
+          <div className="space-y-4 animate-fade-in">
+            <h2 className="text-xl font-bold mb-4 flex items-center gap-2 text-gray-800">
+               Pilih Jabatan Anda
+            </h2>
+            {listJabatan.map(j => (
+              <button key={j} onClick={() => { setJabatan(j); setStep(2); }} 
+                className="w-full p-4 border-2 rounded-xl text-left font-medium hover:border-blue-500 hover:bg-blue-50 transition flex justify-between items-center text-gray-700">
+                {j} <CheckCircle size={20} className="text-gray-300" />
+              </button>
+            ))}
+          </div>
+        )}
+
+        {step === 2 && (
+          <div className="space-y-4 animate-fade-in">
+             <button onClick={() => setStep(1)} className="text-sm text-blue-600 mb-2 font-medium">← Kembali</button>
+            <h2 className="text-xl font-bold mb-4 text-gray-800">Pilih Shift</h2>
+            {(jabatan === 'Host Live' ? listShiftHost : listShiftReguler).map(s => (
+              <button key={s} onClick={() => { setShift(s); setStep(3); }} 
+                className="w-full p-4 border-2 rounded-xl text-left font-medium hover:border-blue-500 hover:bg-blue-50 transition flex justify-between items-center text-gray-700">
+                {s} <Clock size={20} className="text-gray-300" />
+              </button>
+            ))}
+          </div>
+        )}
+
+        {step === 3 && (
+          <div className="space-y-4 animate-fade-in">
+            <button onClick={() => setStep(2)} className="text-sm text-blue-600 mb-2 font-medium">← Kembali</button>
+            <h2 className="text-xl font-bold mb-4 text-gray-800">Status Kehadiran</h2>
+            <button onClick={() => { setStatusKehadiran('Hadir'); setStep(4); }} 
+              className="w-full p-5 border-2 border-green-200 bg-green-50 rounded-xl text-left font-bold text-green-700 hover:border-green-500 transition flex items-center gap-3">
+              <CheckCircle size={24} /> Saya Hadir Hari Ini
+            </button>
+            <button onClick={() => { setStatusKehadiran('Tidak Hadir'); setStep(5); }} 
+              className="w-full p-5 border-2 border-red-200 bg-red-50 rounded-xl text-left font-bold text-red-700 hover:border-red-500 transition flex items-center gap-3">
+              <XCircle size={24} /> Saya Tidak Hadir
+            </button>
+          </div>
+        )}
+
+        {/* Alur Hadir */}
+        {step === 4 && statusKehadiran === 'Hadir' && (
+          <div className="space-y-4 animate-fade-in">
+            <button onClick={() => setStep(3)} className="text-sm text-blue-600 mb-2 font-medium">← Kembali</button>
+            <h2 className="text-xl font-bold mb-4 text-gray-800">Tipe & Foto Absen</h2>
+            
+            <div className="flex gap-2 mb-4">
+              <button onClick={() => setTipeAbsen('Datang')} 
+                className={`flex-1 py-3 rounded-lg font-bold border-2 ${tipeAbsen === 'Datang' ? 'bg-blue-600 text-white border-blue-600' : 'border-gray-300 text-gray-600'}`}>
+                Absen Datang
+              </button>
+              <button onClick={() => setTipeAbsen('Pulang')} 
+                className={`flex-1 py-3 rounded-lg font-bold border-2 ${tipeAbsen === 'Pulang' ? 'bg-indigo-600 text-white border-indigo-600' : 'border-gray-300 text-gray-600'}`}>
+                Absen Pulang
+              </button>
+            </div>
+
+            {tipeAbsen && (
+              <div className="border-2 border-dashed border-gray-300 rounded-xl p-6 flex flex-col items-center justify-center bg-gray-50">
+                {foto ? (
+                  <div className="relative">
+                    <img src={foto} alt="Absen" className="w-full max-h-64 object-cover rounded-lg shadow" />
+                    <button onClick={() => setFoto(null)} className="absolute -top-3 -right-3 bg-red-500 text-white p-1 rounded-full shadow-lg">
+                      <XCircle size={20} />
+                    </button>
+                  </div>
+                ) : (
+                  <>
+                    <Camera size={48} className="text-gray-400 mb-3" />
+                    <p className="text-sm text-gray-500 text-center mb-4">Ambil foto selfie di lokasi kerja untuk validasi kehadiran.</p>
+                    <button onClick={() => fileInputRef.current.click()} className="bg-blue-100 text-blue-700 font-semibold px-4 py-2 rounded-lg flex items-center gap-2">
+                      <Upload size={18} /> Buka Kamera
+                    </button>
+                    <input 
+                      type="file" 
+                      accept="image/*" 
+                      capture="environment" 
+                      className="hidden" 
+                      ref={fileInputRef}
+                      onChange={handlePhotoCapture}
+                    />
+                  </>
+                )}
+              </div>
+            )}
+
+            <button 
+              onClick={handleSubmit} 
+              disabled={!tipeAbsen || !foto || isSubmitting}
+              className="w-full bg-blue-600 disabled:bg-gray-400 text-white font-bold py-4 rounded-xl mt-4 shadow-lg active:scale-95 transition">
+              {isSubmitting ? 'Mengirim Data...' : 'Kirim Absensi'}
+            </button>
+          </div>
+        )}
+
+        {/* Alur Tidak Hadir */}
+        {step === 5 && statusKehadiran === 'Tidak Hadir' && (
+          <div className="space-y-4 animate-fade-in">
+             <button onClick={() => setStep(3)} className="text-sm text-blue-600 mb-2 font-medium">← Kembali</button>
+            <h2 className="text-xl font-bold mb-4 text-gray-800">Keterangan Tidak Hadir</h2>
+            
+            <div className="flex gap-2 mb-4">
+              <button onClick={() => setAlasan('Izin')} 
+                className={`flex-1 py-3 rounded-lg font-bold border-2 ${alasan === 'Izin' ? 'bg-orange-500 text-white border-orange-500' : 'border-gray-300 text-gray-600'}`}>
+                Izin
+              </button>
+              <button onClick={() => setAlasan('Sakit')} 
+                className={`flex-1 py-3 rounded-lg font-bold border-2 ${alasan === 'Sakit' ? 'bg-red-500 text-white border-red-500' : 'border-gray-300 text-gray-600'}`}>
+                Sakit
+              </button>
+            </div>
+
+            {alasan && (
+              <div className="animate-fade-in">
+                <label className="block text-sm font-medium text-gray-700 mb-1">Jelaskan Alasan (Wajib)</label>
+                <textarea 
+                  className="w-full border-2 rounded-xl p-3 focus:ring-2 focus:ring-blue-500 outline-none resize-none h-32"
+                  placeholder="Ketik alasan anda secara detail..."
+                  value={keterangan}
+                  onChange={(e) => setKeterangan(e.target.value)}
+                ></textarea>
+                
+                <button 
+                  onClick={handleSubmit} 
+                  disabled={!keterangan || isSubmitting}
+                  className="w-full bg-blue-600 disabled:bg-gray-400 text-white font-bold py-4 rounded-xl mt-4 shadow-lg active:scale-95 transition">
+                  {isSubmitting ? 'Mengirim Data...' : 'Kirim Keterangan'}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Halaman Sukses */}
+        {step === 100 && (
+          <div className="text-center py-10 animate-fade-in">
+            <div className="bg-green-100 text-green-600 w-24 h-24 rounded-full flex items-center justify-center mx-auto mb-6 shadow-sm">
+              <CheckCircle size={48} />
+            </div>
+            <h2 className="text-2xl font-bold text-gray-800 mb-2">Absen Berhasil!</h2>
+            <p className="text-gray-500 mb-8">{successMsg}</p>
+            <button onClick={resetForm} className="bg-gray-800 text-white font-bold px-8 py-3 rounded-xl shadow hover:bg-gray-900 transition">
+              Kembali ke Menu
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ==========================================
+// ADMIN DASHBOARD
+// ==========================================
+function AdminDashboard({ records, onLogout }) {
+  const [activeTab, setActiveTab] = useState('list'); // 'list' | 'summary'
+
+  // Hitung Akumulasi Jam per Karyawan per Hari
+  const calculateSummary = () => {
+    const summary = {};
+    
+    records.forEach(rec => {
+      if (rec.status !== 'Hadir') return;
+      const key = `${rec.date}_${rec.name}`;
+      if (!summary[key]) {
+        summary[key] = { date: rec.date, name: rec.name, jabatan: rec.jabatan, datang: null, pulang: null, totalMins: 0 };
+      }
+      if (rec.tipe === 'Datang' && (!summary[key].datang || rec.timestamp < summary[key].datang.timestamp)) {
+        summary[key].datang = rec;
+      }
+      if (rec.tipe === 'Pulang' && (!summary[key].pulang || rec.timestamp > summary[key].pulang.timestamp)) {
+        summary[key].pulang = rec;
+      }
+    });
+
+    return Object.values(summary).map(item => {
+      if (item.datang && item.pulang) {
+        const diffMs = item.pulang.timestamp - item.datang.timestamp;
+        item.totalMins = Math.floor(diffMs / 60000);
+      }
+      return item;
+    });
+  };
+
+  const exportToCSV = () => {
+    let headers = "Tanggal,Waktu,Nama,Jabatan,Shift,Status,Tipe,Keterlambatan,Keterangan\n";
+    let csvContent = records.map(r => {
+      const isLateStr = r.isLate ? "Terlambat" : (r.status === 'Hadir' && r.tipe === 'Datang' ? "Tepat Waktu" : "-");
+      // Mencegah koma merusak format CSV
+      const ket = r.keterangan.replace(/,/g, ' '); 
+      return `${r.date},${r.time},${r.name},${r.jabatan},${r.shift},${r.status},${r.tipe},${isLateStr},${ket}`;
+    }).join("\n");
+
+    const blob = new Blob([headers + csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", `Laporan_Absensi_${new Date().toLocaleDateString('id-ID')}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const printPDF = () => {
+    window.print();
+  };
+
+  const formatHours = (mins) => {
+    if (!mins) return '-';
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    return `${h}j ${m}m`;
+  };
+
+  const summaryData = calculateSummary();
+
+  return (
+    <div className="min-h-screen bg-gray-100 p-4 sm:p-8 printable">
+      <div className="max-w-6xl mx-auto">
+        <div className="flex flex-col sm:flex-row justify-between items-center bg-white p-6 rounded-2xl shadow-sm mb-6 print:shadow-none">
+          <div>
+            <h1 className="text-2xl font-bold text-gray-800 flex items-center gap-2">
+              <Calendar className="text-blue-600" /> Database Kehadiran
+            </h1>
+            <p className="text-sm text-gray-500 mt-1">Sistem Otomatis Karyawan</p>
+          </div>
+          <div className="flex flex-wrap gap-2 mt-4 sm:mt-0 no-print">
+            <button onClick={exportToCSV} className="bg-green-600 text-white px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 hover:bg-green-700">
+              <FileSpreadsheet size={16} /> Export Excel (CSV)
+            </button>
+            <button onClick={printPDF} className="bg-red-600 text-white px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 hover:bg-red-700">
+              <FileText size={16} /> Cetak PDF
+            </button>
+            <button onClick={onLogout} className="bg-gray-800 text-white px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 hover:bg-gray-900">
+              <LogOut size={16} /> Keluar
+            </button>
+          </div>
+        </div>
+
+        <div className="bg-white rounded-2xl shadow-sm overflow-hidden no-print mb-4">
+          <div className="flex border-b">
+            <button 
+              className={`flex-1 py-3 font-semibold ${activeTab === 'list' ? 'bg-blue-50 text-blue-700 border-b-2 border-blue-600' : 'text-gray-500'}`}
+              onClick={() => setActiveTab('list')}>
+              Log Aktivitas Harian
+            </button>
+            <button 
+              className={`flex-1 py-3 font-semibold ${activeTab === 'summary' ? 'bg-blue-50 text-blue-700 border-b-2 border-blue-600' : 'text-gray-500'}`}
+              onClick={() => setActiveTab('summary')}>
+              Akumulasi Jam Kerja
+            </button>
+          </div>
+        </div>
+
+        {activeTab === 'list' && (
+          <div className="bg-white rounded-2xl shadow-sm overflow-x-auto">
+            <table className="w-full text-left text-sm text-gray-600 print:text-xs">
+              <thead className="bg-gray-50 text-gray-700 uppercase font-bold border-b">
+                <tr>
+                  <th className="p-4">Tgl & Waktu</th>
+                  <th className="p-4">Nama</th>
+                  <th className="p-4">Jabatan & Shift</th>
+                  <th className="p-4">Status & Tipe</th>
+                  <th className="p-4">Keterangan</th>
+                  <th className="p-4 no-print">Foto</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {records.length === 0 ? (
+                  <tr><td colSpan="6" className="p-8 text-center text-gray-400">Belum ada data absensi.</td></tr>
+                ) : records.map(r => (
+                  <tr key={r.id} className="hover:bg-gray-50">
+                    <td className="p-4 font-medium text-gray-800">
+                      {r.date} <br/><span className="text-xs text-gray-500">{r.time}</span>
+                    </td>
+                    <td className="p-4 font-bold">{r.name}</td>
+                    <td className="p-4">
+                      {r.jabatan} <br/>
+                      <span className="text-xs bg-gray-200 px-2 py-1 rounded mt-1 inline-block">{r.shift}</span>
+                    </td>
+                    <td className="p-4">
+                      {r.status === 'Hadir' ? (
+                        <div>
+                          <span className="text-green-600 font-bold bg-green-50 px-2 py-1 rounded mr-2">{r.tipe}</span>
+                          {r.isLate && r.tipe === 'Datang' && (
+                            <span className="text-xs text-red-600 bg-red-100 px-2 py-1 rounded inline-flex items-center gap-1 mt-1">
+                              <AlertTriangle size={12}/> Terlambat
+                            </span>
+                          )}
+                        </div>
+                      ) : (
+                        <span className="text-red-600 font-bold bg-red-50 px-2 py-1 rounded">{r.status} - {r.alasan}</span>
+                      )}
+                    </td>
+                    <td className="p-4 max-w-[200px] truncate">{r.keterangan}</td>
+                    <td className="p-4 no-print">
+                      {r.foto ? (
+                        <img src={r.foto} alt="Absen" className="w-12 h-12 rounded object-cover border cursor-pointer hover:scale-150 transition-transform origin-right" />
+                      ) : '-'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {activeTab === 'summary' && (
+          <div className="bg-white rounded-2xl shadow-sm overflow-x-auto">
+             <table className="w-full text-left text-sm text-gray-600 print:text-xs">
+              <thead className="bg-gray-50 text-gray-700 uppercase font-bold border-b">
+                <tr>
+                  <th className="p-4">Tanggal</th>
+                  <th className="p-4">Nama</th>
+                  <th className="p-4">Jabatan</th>
+                  <th className="p-4">Jam Datang</th>
+                  <th className="p-4">Jam Pulang</th>
+                  <th className="p-4 bg-blue-50 text-blue-800">Total Jam Kerja</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {summaryData.length === 0 ? (
+                  <tr><td colSpan="6" className="p-8 text-center text-gray-400">Belum ada data akumulasi (Butuh absen Datang & Pulang).</td></tr>
+                ) : summaryData.map((s, i) => (
+                  <tr key={i} className="hover:bg-gray-50">
+                    <td className="p-4 font-medium">{s.date}</td>
+                    <td className="p-4 font-bold text-gray-800">{s.name}</td>
+                    <td className="p-4">{s.jabatan}</td>
+                    <td className="p-4 text-green-600 font-medium">{s.datang ? s.datang.time : 'Belum Absen'}</td>
+                    <td className="p-4 text-indigo-600 font-medium">{s.pulang ? s.pulang.time : 'Belum Absen'}</td>
+                    <td className="p-4 font-bold bg-blue-50 text-blue-700">
+                      {formatHours(s.totalMins)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+      </div>
+      
+      {/* CSS Khusus untuk Print (PDF) */}
+      <style dangerouslySetInnerHTML={{__html: `
+        @media print {
+          body { background: white; }
+          .no-print { display: none !important; }
+          .print\\:shadow-none { box-shadow: none !important; }
+          .print\\:text-xs { font-size: 0.75rem !important; }
+        }
+      `}} />
+    </div>
+  );
+}
+
+
+```
